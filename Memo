@@ -1,0 +1,6 @@
+1. train_target 데이터(fisheye data)를 training에 사용할 수 있도록 semi-supervised learning방법을 생각해보아야 함.
+2. optimizer와 같은 parameter선택
+
+3. AugSeg는 semi-sup learning과 중간에 Augmentation을 할 수 있음(fisheye로 augmentation을 한다면 좋을 것 같음)
++) pre-trained 된 backbone을 사용하기 때문에 성능이 좋을 것으로 예상된다.
+
