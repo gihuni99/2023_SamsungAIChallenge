@@ -105,7 +105,7 @@ for epoch in range(args.epochs):  # 에폭
 
         optimizer.zero_grad()
         outputs = model(images)
-        outputs = nnf.interpolate(outputs, size=(224, 224), mode='bicubic', align_corners=True) # 일단 True로
+        outputs = nnf.interpolate(outputs, size=(args.resize, args.resize), mode='bicubic', align_corners=True) # 일단 True로
         loss = criterion(outputs, masks.squeeze(1)) # outputs: [16, 13, 53*4, 53*4], target [16, 224, 224]
         loss.backward()
         optimizer.step()
@@ -119,7 +119,7 @@ for epoch in range(args.epochs):  # 에폭
         image = image.float().to(device)
         mask = mask.long().to(device)
         y_pred = model(image)
-        y_pred = nnf.interpolate(y_pred, size=(224, 224), mode='bicubic', align_corners = True)
+        y_pred = nnf.interpolate(y_pred, size=(args.resize, args.resize), mode='bicubic', align_corners = True)
         loss = criterion(y_pred, mask.squeeze(1))
         val_loss += loss.item()
     epoch_loss /= len(dataloader)

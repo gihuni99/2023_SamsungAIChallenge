@@ -125,6 +125,9 @@ class dec_deeplabv3_plus(nn.Module):
 
 
 class Aux_Module(nn.Module):
+    #in_planes: 입력 특성 맵의 채널 수
+    #num_classes: 출력 클래스의 개수
+    #sync_bn: Batch Normalization을 동기화할지 여부
     def __init__(self, in_planes, num_classes=19, sync_bn=False):
         super(Aux_Module, self).__init__()
 
