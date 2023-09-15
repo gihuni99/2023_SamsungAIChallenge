@@ -156,6 +156,7 @@ def main():
 #     num_negatives: 50
 #     num_queries: 256
 #     temperature: 0.5
+
     # Optimizer and lr decay scheduler
     cfg_trainer = cfg["trainer"] #cfg_trainer에 yaml파일의 모든 trainer parameter저장
     cfg_optim = cfg_trainer["optimizer"]
@@ -197,14 +198,21 @@ def main():
     best_prec = 0
     last_epoch = 0
 
+#  saver:
+#   auto_resume: True  
+#   snapshot_dir: checkpoints
+#   pretrain: ''
+
     # auto_resume > pretrain
-    if cfg["saver"].get("auto_resume", False):
-        lastest_model = os.path.join(cfg["save_path"], "ckpt.pth")
+    #이전에 학습시킨 모델을 이어서 학습하고 싶을 때 사용하는 코드(save_path를 yaml파일에 지정해주어야 사용가능)
+    #auto_resume이 True이면 학습이 중단되면 자동으로 이전 체크포인트에서부터 학습
+    if cfg["saver"].get("auto_resume", False):#auto_resume이 존재하지 않으면 get()함수를 통해 False를 선택
+        lastest_model = os.path.join(cfg["save_path"], "ckpt.pth") 
         if not os.path.exists(lastest_model):
             "No checkpoint found in '{}'".format(lastest_model)
         else:
             print(f"Resume model from: '{lastest_model}'")
-            best_prec, last_epoch = load_state(
+            best_prec, last_epoch = load_state( #utils/utils.py에 정의된 ckeckpoint파일 불러오는 함수
                 lastest_model, model, optimizer=optimizer, key="model_state"
             )
             _, _ = load_state(
@@ -215,12 +223,13 @@ def main():
         load_state(cfg["saver"]["pretrain"], model, key="model_state")
         load_state(cfg["saver"]["pretrain"], model_teacher, key="teacher_state")
 
-    optimizer_start = get_optimizer(params_list, cfg_optim)
+    optimizer_start = get_optimizer(params_list, cfg_optim) #위에서 불러온 cfg_optim를 사용하여 optimizer 정의
     lr_scheduler = get_scheduler(
-        cfg_trainer, len(train_loader_sup), optimizer_start, start_epoch=last_epoch
+        cfg_trainer, len(train_loader_sup), optimizer_start, start_epoch=last_epoch #이어서 학습하는 것이 아니면 last_epoch=0
     )
 
     # build class-wise memory bank
+    #class의 수에 따라 설정됨(num_classes)
     memobank = []
     queue_ptrlis = []
     queue_size = []
@@ -241,7 +250,8 @@ def main():
     ).cuda()
 
     # Start to train model
-    for epoch in range(last_epoch, cfg_trainer["epochs"]):
+    #위에서 설정한 파라미터 값들을 통해 train함수로 모델 학습
+    for epoch in range(last_epoch, cfg_trainer["epochs"]): 
         # Training
         train(
             model,
@@ -260,6 +270,7 @@ def main():
         )
 
         # Validation
+        #validation을 하는 구간
         if cfg_trainer["eval_on"]:
             if rank == 0:
                 logger.info("start evaluation")
@@ -294,24 +305,24 @@ def main():
 
 
 def train(
-    model,
-    model_teacher,
+    model, #s_model: 실제로 학습할 모델
+    model_teacher, #t_model: 가중치를 일부 공유하는 모델(가르치는 모델)
     optimizer,
-    lr_scheduler,
-    sup_loss_fn,
-    loader_l,
-    loader_u,
-    epoch,
-    tb_logger,
+    lr_scheduler, #Lr조절
+    sup_loss_fn, #supervised learning모델의 Loss function
+    loader_l, #label이 있는 데이터를 불러옴 #dataset/builder.py의 함수를 통해 데이터를 불러온다
+    loader_u, #label이 없는 데이터를 불러옴
+    epoch, #진행중인(현재) epoch수
+    tb_logger, #tensor board
     logger,
-    memobank,
+    memobank, #메모리 관련 변수
     queue_ptrlis,
     queue_size,
 ):
     global prototype
-    ema_decay_origin = cfg["net"]["ema_decay"]
+    ema_decay_origin = cfg["net"]["ema_decay"]  #yaml파일에 정의되어있고, 0.99로 고정된 파라미터이다.
 
-    model.train()
+    model.train()#모델 학습
 
     loader_l.sampler.set_epoch(epoch)
     loader_u.sampler.set_epoch(epoch)
