@@ -73,8 +73,18 @@ target_data = Target(csv_file= os.path.join(args.datadir, 'train_target.csv'), t
 target_loader = DataLoader(dataset, batch_size=args.batch_size, suffle=True, num_workers=4)
 
 
-# model 초기화
-model = Segformer(
+# student_model 초기화
+student_model = Segformer(
+    dims = (32, 64, 160, 256),      # dimensions of each stage
+    heads = (1, 2, 5, 8),           # heads of each stage
+    ff_expansion = (8, 8, 4, 4),    # feedforward expansion factor of each stage
+    reduction_ratio = (8, 4, 2, 1), # reduction ratio of each stage for efficient attention
+    num_layers = 2,                 # num layers of each stage
+    decoder_dim = 256,              # decoder dimension
+    num_classes = 13                 # number of segmentation classes
+).to(device)
+# teacher_model 초기화
+teacher_model = Segformer(
     dims = (32, 64, 160, 256),      # dimensions of each stage
     heads = (1, 2, 5, 8),           # heads of each stage
     ff_expansion = (8, 8, 4, 4),    # feedforward expansion factor of each stage
@@ -84,44 +94,60 @@ model = Segformer(
     num_classes = 13                 # number of segmentation classes
 ).to(device)
 
+
 # Print model's state_dict
 print("Model's state_dict:")
-for param_tensor in model.state_dict():
-    print(param_tensor, "\t", model.state_dict()[param_tensor].size())
+for param_tensor in student_model.state_dict():
+    print(param_tensor, "\t", student_model.state_dict()[param_tensor].size())
+
+## To do list
+## Teacher Model
+## Weak Geometrical Aug
+# Random Intensity Based Aug
+## adaptive label-injecting aug
+# student model
+# stop gradient
+# psudo-student
+# psudo-teacher
+# unsupervised consistency loss
+
+
 
 # loss function과 optimizer 정의
-criterion = torch.nn.CrossEntropyLoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+supervised_loss = torch.nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(student_model.parameters(), lr=args.lr)
 
 # training loop
 best_loss = 1000
 patience_limit = 3
 patience_count = 0
 for epoch in range(args.epochs):  # 에폭
-    model.train()
+    student_model.train()
+    teacher_model.train()
+    momentum = 0.999
     epoch_loss = 0
     for images, masks in tqdm(dataloader):
         images = images.float().to(device)
         masks = masks.long().to(device)
 
         optimizer.zero_grad()
-        outputs = model(images)
+        outputs = student_model(images)
         outputs = nnf.interpolate(outputs, size=(args.resize, args.resize), mode='bicubic', align_corners=True) # 일단 True로
-        loss = criterion(outputs, masks.squeeze(1)) # outputs: [16, 13, 53*4, 53*4], target [16, 224, 224]
-        loss.backward()
+        l_x = supervised_loss(outputs, masks.squeeze(1)) # outputs: [16, 13, 53*4, 53*4], target [16, 224, 224]
+        l_x.backward()
         optimizer.step()
 
-        epoch_loss += loss.item()
+        epoch_loss += l_x.item()
     
     # validation
-    model.eval()
+    student_model.eval()
     val_loss = 0
     for image, mask in val_dataloader:
         image = image.float().to(device)
         mask = mask.long().to(device)
-        y_pred = model(image)
+        y_pred = student_model(image)
         y_pred = nnf.interpolate(y_pred, size=(args.resize, args.resize), mode='bicubic', align_corners = True)
-        loss = criterion(y_pred, mask.squeeze(1))
+        loss = supervised_loss(y_pred, mask.squeeze(1))
         val_loss += loss.item()
     epoch_loss /= len(dataloader)
     val_loss /= len(val_dataloader)
@@ -137,7 +163,7 @@ for epoch in range(args.epochs):  # 에폭
         best_loss = val_loss
         patience_count = 0
         # Save Models
-        torch.save(model.state_dict(), os.path.join(args.outdir, starttime + '_best.pt'))
+        torch.save(student_model.state_dict(), os.path.join(args.outdir, starttime + '_best.pt'))
         print(f'Model has been saved in {os.path.join(args.outdir, starttime)}_best.pt')
 
 # Evaluation
@@ -146,11 +172,11 @@ test_dataset = CustomDataset(csv_file= os.path.join(args.datadir, 'test.csv'), t
 test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
 with torch.no_grad():
-    model.eval()
+    student_model.eval()
     result = []
     for images in tqdm(test_dataloader):
         images = images.float().to(device)
-        outputs = model(images)
+        outputs = student_model(images)
         outputs = torch.softmax(outputs, dim=1).cpu()
         outputs = torch.argmax(outputs, dim=1).numpy()
         # batch에 존재하는 각 이미지에 대해서 반복
