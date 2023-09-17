@@ -11,6 +11,7 @@ from torch.utils.data import Dataset, DataLoader
 from torch.utils.data import RandomSampler
 from torchvision import transforms
 import torch.nn.functional as nnf
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from tqdm import tqdm
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
@@ -18,10 +19,10 @@ from utils.segformer import Segformer
 from utils.dataloader import CustomDataset, Target
 from utils.augseg import *
 
+
 # 1. Data증강 부분 분리/함수 추가/제거 + Fisheye << 이거에 집착하지말고 가장 나중에..
 # 2. Pytorch 호환되는지 확인 후 Segformer 부분 HuggingFace 이용해서 불러오고. 적용 (전이학습)
 # 3. Learning Rate Scheduler 구현
-
 # 4 (같이 해도 좋음). 실험. 적정 에포크/segformer 모델 사이즈. 하이퍼파라미터 튜닝
 
 
@@ -82,7 +83,7 @@ transform_A_g = A.Compose(
     [   
         A.RandomScale(always_apply=True, scale_limit=[0.5,1.0])
         A.HorizontalFlip(always_apply=False, p=0.5),
-        A.RandomCrop(height=448, width=448,always_apply=True)
+        A.RandomCrop(height=1024, width=1024,always_apply=True)
     ]
 )
 
@@ -159,6 +160,7 @@ for param_tensor in student_model.state_dict():
 # loss function과 optimizer 정의
 ce_loss = torch.nn.CrossEntropyLoss()
 optimizer = torch.optim.Adam(student_model.parameters(), lr=args.lr)
+scheduler = CosineAnnealingWarmRestarts(optimizer=optimizer, T_0=50, T_mult=2, eta_min=0.001)
 
 # training loop
 for epoch in range(args.epochs):  # 에폭
@@ -194,6 +196,7 @@ for epoch in range(args.epochs):  # 에폭
             l_u_loss += l_u.item()
             with torch.no_grad():
                 ema_decay = 0.0 # 첫번째 epoch: student => teacher copy
+        scheduler.step()
 
 #여기에서는 targetdata를 augmentation한 것과 안한 것을 따로 불러와야 함
 #따라서 teacher와 student에 사용할 target data를 각각의 dataloader로 따로 불러와야 한다.
@@ -266,6 +269,7 @@ for epoch in range(args.epochs):  # 에폭
             epoch_loss += loss.item()
             l_x_loss += l_x.item()
             l_u_loss += l_u.item()
+        scheduler.step()
 
 
     # validation
