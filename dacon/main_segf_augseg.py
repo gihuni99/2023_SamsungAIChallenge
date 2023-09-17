@@ -8,6 +8,7 @@ import wandb
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import RandomSampler
 from torchvision import transforms
 import torch.nn.functional as nnf
 from tqdm import tqdm
@@ -15,7 +16,18 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from utils.segformer import Segformer
 from utils.dataloader import CustomDataset, Target
+from utils.augseg import *
+
+# 1. Data증강 부분 분리/함수 추가/제거 + Fisheye << 이거에 집착하지말고 가장 나중에..
+# 2. Pytorch 호환되는지 확인 후 Segformer 부분 HuggingFace 이용해서 불러오고. 적용 (전이학습)
+# 3. Learning Rate Scheduler 구현
+
+# 4 (같이 해도 좋음). 실험. 적정 에포크/segformer 모델 사이즈. 하이퍼파라미터 튜닝
+
+
+
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+torch.manual_seed(17)
 
 parser = argparse.ArgumentParser(description="Dacon")
 parser.add_argument("--epochs", type=int, default=20)
@@ -25,7 +37,10 @@ parser.add_argument("--num_workers", type=int, default=4)
 parser.add_argument("--batch_size", type=int, default=16)
 parser.add_argument("--datadir", type=str, default="./dataset")
 parser.add_argument("--outdir", type=str, default="./out")
+parser.add_argument("--warmup", type=int, default=0, help="0 or 1")
 args = parser.parse_args()
+
+
 
 if not os.path.exists(args.outdir):
     os.makedirs(args.outdir)
@@ -48,6 +63,7 @@ wandb.init(
 
 
 
+
 # RLE 인코딩 함수
 def rle_encode(mask):
     pixels = mask.flatten()
@@ -60,39 +76,60 @@ def rle_encode(mask):
 transform = A.Compose(
     [   
         A.Resize(args.resize, args.resize),
+        A.Cutout(always_apply=True, p=0.5, num_holes=10, max_h_size=28, max_w_size=28),
+        A.HorizontalFlip(always_apply=True, p=0.5),
+
+        A.OneOf([
+            A.GaussianBlur(p=1),
+            A.RandomContrast(p=1),
+            A.Equalize(mode='cv', p=1),
+            A.Posterize(num_bits=4, p=1),
+            A.RandomBrightness(limit=0.2, p=1),
+            A.ColorJitter(p=1),
+            A.Sharpen(p=1)
+        ], p=0.875),
         A.Normalize(),
         ToTensorV2()
     ]
 )
 
 dataset = CustomDataset(csv_file=  os.path.join(args.datadir, 'train_source.csv'), transform=transform)
-dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
+dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, drop_last=True)
 val_dataset = CustomDataset(csv_file=  os.path.join(args.datadir, 'val_source.csv'), transform=transform)
 val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
 target_data = Target(csv_file= os.path.join(args.datadir, 'train_target.csv'), transform=transform)
-target_loader = DataLoader(dataset, batch_size=args.batch_size, suffle=True, num_workers=4)
+target_loader = DataLoader(target_data, batch_size=args.batch_size, shuffle=True, num_workers=4, drop_last=True) 
 
 
 # student_model 초기화
 student_model = Segformer(
-    dims = (32, 64, 160, 256),      # dimensions of each stage
+    dims = (64, 128, 320, 512),      # dimensions of each stage
     heads = (1, 2, 5, 8),           # heads of each stage
     ff_expansion = (8, 8, 4, 4),    # feedforward expansion factor of each stage
     reduction_ratio = (8, 4, 2, 1), # reduction ratio of each stage for efficient attention
     num_layers = 2,                 # num layers of each stage
-    decoder_dim = 256,              # decoder dimension
+    decoder_dim = 512,              # decoder dimension
     num_classes = 13                 # number of segmentation classes
 ).to(device)
 # teacher_model 초기화
 teacher_model = Segformer(
-    dims = (32, 64, 160, 256),      # dimensions of each stage
+    dims = (64, 128, 320, 512),      # dimensions of each stage
     heads = (1, 2, 5, 8),           # heads of each stage
     ff_expansion = (8, 8, 4, 4),    # feedforward expansion factor of each stage
     reduction_ratio = (8, 4, 2, 1), # reduction ratio of each stage for efficient attention
     num_layers = 2,                 # num layers of each stage
-    decoder_dim = 256,              # decoder dimension
+    decoder_dim = 512,              # decoder dimension
     num_classes = 13                 # number of segmentation classes
 ).to(device)
+
+
+for p in teacher_model.parameters():
+    p.requires_grad = False
+
+# initialize teacher model -- not neccesary if using warmup
+with torch.no_grad():
+    for t_params, s_params in zip(teacher_model.parameters(), student_model.parameters()):
+        t_params.data = s_params.data
 
 
 # Print model's state_dict
@@ -101,70 +138,147 @@ for param_tensor in student_model.state_dict():
     print(param_tensor, "\t", student_model.state_dict()[param_tensor].size())
 
 ## To do list
-## Teacher Model
-## Weak Geometrical Aug
-# Random Intensity Based Aug
-## adaptive label-injecting aug
-# student model
-# stop gradient
-# psudo-student
-# psudo-teacher
-# unsupervised consistency loss
+## tensor dim! squeeze 
 
 
 
 # loss function과 optimizer 정의
-supervised_loss = torch.nn.CrossEntropyLoss()
+ce_loss = torch.nn.CrossEntropyLoss()
 optimizer = torch.optim.Adam(student_model.parameters(), lr=args.lr)
 
 # training loop
-best_loss = 1000
-patience_limit = 3
-patience_count = 0
 for epoch in range(args.epochs):  # 에폭
     student_model.train()
-    teacher_model.train()
-    momentum = 0.999
+    teacher_model.eval()
+    ema_decay_origin = 0.999
+    warmup_epoch = args.warmup
     epoch_loss = 0
-    for images, masks in tqdm(dataloader):
-        images = images.float().to(device)
-        masks = masks.long().to(device)
-
-        optimizer.zero_grad()
-        outputs = student_model(images)
-        outputs = nnf.interpolate(outputs, size=(args.resize, args.resize), mode='bicubic', align_corners=True) # 일단 True로
-        l_x = supervised_loss(outputs, masks.squeeze(1)) # outputs: [16, 13, 53*4, 53*4], target [16, 224, 224]
-        l_x.backward()
-        optimizer.step()
-
-        epoch_loss += l_x.item()
+    l_x_loss = 0
+    l_u_loss = 0
+    data_length = min(len(dataloader), len(target_loader))
+    if epoch < warmup_epoch: # 0 또는 1로 하는거같음.
+        for images, masks in tqdm(dataloader):
+            images = images.float().to(device)
+            masks = masks.long().to(device)
+            p_y = student_model(images) # tensor[b 13 w/4 h/4] << score 값. 각 픽셀에서 각 클래스마다 
+            p_y = nnf.interpolate(p_y, size=(args.resize, args.resize), mode='bicubic', align_corners=True)
+            # tensor [b 13 w h]
+            # mask > gray scale image  tensor [b 1 w h]
+            l_x = ce_loss(p_y, masks.squeeze(1))
+            # tensor [b w h]
     
+            l_u = torch.tensor(0.0).cuda()
+            
+            loss = l_x + l_u
+
+            # update student model
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+            l_x_loss += l_x.item()
+            l_u_loss += l_u.item()
+            with torch.no_grad():
+                ema_decay = 0.0 # 첫번째 epoch: student => teacher copy
+
+    else: # now starts augseg 
+        for i, data in enumerate(zip(tqdm(dataloader), target_loader)):
+            i_iter = epoch  * data_length + i # 지금까지 총 iteration
+            # get the inputs; data is a list of [inputs, labels]
+            source, target_image = data
+            source_image, source_mask = source
+            target_image = target_image.float().to(device)
+            source_image = source_image.float().to(device)
+            source_mask = source_mask.long().to(device)
+            # generate pseudo label
+            with torch.no_grad():
+                teacher_model.eval()
+                pred_t = teacher_model(target_image.detach())
+                pred_t = nnf.interpolate(pred_t, size=(args.resize, args.resize), mode='bicubic', align_corners=True)
+                pred_t = torch.softmax(pred_t, dim=1)
+                # p_t = torch.argmax(p_t, dim=1)
+                p_t_logit, p_t = torch.max(pred_t, dim=1)
+
+                # obtain confidence
+                entropy = -torch.sum(pred_t * torch.log(pred_t + 1e-10), dim=1)
+                entropy /= np.log(13)
+                confidence = 1.0 - entropy
+                confidence = confidence * p_t_logit
+                confidence = confidence.mean(dim=[1,2])  # 1*C
+                confidence = confidence.cpu().numpy().tolist()
+                # confidence = logits_u_aug.ge(p_threshold).float().mean(dim=[1,2]).cpu().numpy().tolist()
+                del pred_t
+            student_model.train()
+            #todo: apply addptive cutmix
+            if np.random.uniform(0,1) < 0.5:
+                target_image, p_t, p_t_logit = cut_mix_label_adaptive(target_image, p_t, p_t_logit, source_image, source_mask, confidence)
+            # 3. forward concate labeled + unlabeld into student networks
+            num_labeled = len(source_image) # b
+            pred_all = student_model(torch.cat((source_image, target_image), dim=0)) # ( 2*b, 13, w/4, h/4)
+            pred_all = nnf.interpolate(pred_all, size=(args.resize, args.resize), mode='bicubic', align_corners=True)
+            # pred all [2b, 13, w, h]
+            pred_l= pred_all[:num_labeled] # 0~b
+            pred_u_strong = pred_all[num_labeled:] # b~2b
+
+            # get supervised loss (l_x)
+            l_x = ce_loss(pred_l, source_mask)
+            
+            # get unsupervised loss (l_u)
+            l_u, pseudo_high_ratio = compute_unsupervised_loss_by_threshold(pred_u_strong, p_t.detach(), p_t_logit.detach(),
+                                                                            thresh=0.95)
+
+            with torch.no_grad():
+                ema_decay = min(1- 1/ (i_iter - data_length * warmup_epoch+ 1), ema_decay_origin)
+            
+            loss = l_x + l_u
+
+            # update student model
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            # update teacher model with EMA
+            with torch.no_grad():
+                for param_train, param_eval in zip(student_model.parameters(), teacher_model.parameters()):
+                    param_eval.data = param_eval.data * ema_decay + param_train.data * (1 - ema_decay)
+                # update bn
+                for buffer_train, buffer_eval in zip(student_model.buffers(), teacher_model.buffers()):
+                    buffer_eval.data = buffer_eval.data * ema_decay + buffer_train.data * (1 - ema_decay)
+                    # buffer_eval.data = buffer_train.data
+            epoch_loss += loss.item()
+            l_x_loss += l_x.item()
+            l_u_loss += l_u.item()
+
+
     # validation
     student_model.eval()
-    val_loss = 0
+    intersection_epoch = 0
+    union_epoch = 0
     for image, mask in val_dataloader:
         image = image.float().to(device)
         mask = mask.long().to(device)
-        y_pred = student_model(image)
-        y_pred = nnf.interpolate(y_pred, size=(args.resize, args.resize), mode='bicubic', align_corners = True)
-        loss = supervised_loss(y_pred, mask.squeeze(1))
-        val_loss += loss.item()
-    epoch_loss /= len(dataloader)
-    val_loss /= len(val_dataloader)
-    wandb.log({"train_loss": epoch_loss, "val_loss": val_loss})
+        with torch.no_grad():
+            pred = student_model(image)
+        pred = nnf.interpolate(pred, size=(args.resize, args.resize), mode='bicubic', align_corners = True)
+        pred = torch.softmax(pred, dim=1).cpu()
+        pred = torch.argmax(pred, dim=1).numpy()
+        target_origin = mask.cpu().numpy()
+        
+        intersection, union, target = intersectionAndUnion(pred, target_origin, 13, ignore_index=12)
+        intersection_epoch += intersection
+        union_epoch += union
+    iou_class = intersection_epoch/(union_epoch + 1e-10)
+    mIoU = np.mean(iou_class)
 
-    print(f'Epoch {epoch+1}, train_Loss: {epoch_loss}, val_loss: {val_loss}')
+    wandb.log({"loss": epoch_loss/data_length,
+               "l_x": l_x_loss/data_length,
+               "l_u": l_u_loss/data_length,
+               "mIoU": mIoU})
 
-    if val_loss > best_loss:
-        patience_count += 1
-        if patience_count >= patience_limit:
-            break
-    else:
-        best_loss = val_loss
-        patience_count = 0
-        # Save Models
-        torch.save(student_model.state_dict(), os.path.join(args.outdir, starttime + '_best.pt'))
-        print(f'Model has been saved in {os.path.join(args.outdir, starttime)}_best.pt')
+    print(f'Epoch {epoch+1}, mIoU: {mIoU}')
+
+    torch.save(student_model.state_dict(), os.path.join(args.outdir, starttime + '.pt'))
+    print(f'Model has been saved in {os.path.join(args.outdir, starttime)}.pt')
 
 # Evaluation
 
@@ -193,9 +307,6 @@ with torch.no_grad():
                     result.append(mask_rle)
                 else: # 마스크가 존재하지 않는 경우 -1
                     result.append(-1)
-
-
-
 
 
 submit = pd.read_csv(os.path.join(args.datadir, 'sample_submission.csv'))

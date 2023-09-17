@@ -387,7 +387,8 @@ def train(
                         model_teacher.parameters(), model.parameters()
                     ):
                         t_params.data = s_params.data
-
+            #####gihun
+            #여기에서  teacher model로 pseudo label예측하는 것 같다.
             # generate pseudo labels first
             model_teacher.eval()
             pred_u_teacher = model_teacher(image_u)["pred"]
@@ -422,7 +423,7 @@ def train(
             pred_u_large = F.interpolate(
                 pred_u, size=(h, w), mode="bilinear", align_corners=True
             )
-
+            
             # supervised loss
             if "aux_loss" in cfg["net"].keys():
                 aux = outs["aux"][:num_labeled]
@@ -431,6 +432,7 @@ def train(
             else:
                 sup_loss = sup_loss_fn(pred_l_large, label_l.clone())
 
+            #gihun
             # teacher forward
             model_teacher.train()
             with torch.no_grad():
@@ -460,7 +462,7 @@ def train(
                     )
                     * cfg["trainer"]["unsupervised"].get("loss_weight", 1)
             )
-
+            #gihun
             # contrastive loss using unreliable pseudo labels
             contra_flag = "none"
             if cfg["trainer"].get("contrastive", False):
@@ -617,6 +619,8 @@ def train(
                 for t_params, s_params in zip(
                     model_teacher.parameters(), model.parameters()
                 ):
+                    #gihun
+                    ## teaher model의 파라미터를 EMA를 통해 updata
                     t_params.data = (
                         ema_decay * t_params.data + (1 - ema_decay) * s_params.data
                     )
