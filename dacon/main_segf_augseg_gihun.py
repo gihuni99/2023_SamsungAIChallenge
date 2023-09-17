@@ -78,31 +78,40 @@ def rle_encode(mask):
 # A_r을 단일로 사용하는 것보다.(A_r(A_a))로 사용하는 것이 더 좋은 성능이 나왔다고 주장함.
 #cut_mix augmentation은 논문 github에서 코드 따와야 할 것 같다.
 
-transform = A.Compose(
+transform_A_g = A.Compose(
     [   
-        A.Resize(args.resize, args.resize),
-        A.Cutout(always_apply=True, p=0.5, num_holes=10, max_h_size=28, max_w_size=28),
-        A.HorizontalFlip(always_apply=True, p=0.5),
+        A.RandomScale(always_apply=True, scale_limit=[0.5,1.0])
+        A.HorizontalFlip(always_apply=False, p=0.5),
+        A.RandomCrop(height=448, width=448,always_apply=True)
+    ]
+)
 
-        A.OneOf([
-            A.GaussianBlur(p=1),
-            A.RandomContrast(p=1),
-            A.Equalize(mode='cv', p=1),
-            A.Posterize(num_bits=4, p=1),
-            A.RandomBrightness(limit=0.2, p=1),
-            A.ColorJitter(p=1),
-            A.Sharpen(p=1)
-        ], p=0.875),
+transform_A_r = A.Compose(
+    [   
+        A.SomeOf([
+            A.ColorJitter(brightness=0,contrast=0,saturation=0, hue=0, always_apply=True) #Identity
+            A.ColorJitter(brightness=0,contrast=(2,2),saturation=0, hue=0, always_apply=True) #Autocontrast
+            A.Equalize(mode='cv', by_channels=True, always_apply=True) #Histogram Equalization
+            A.GaussianBlur(always_apply=True) #Gaussian blur
+            A.ColorJitter(brightness=0,contrast=(0.05,0.95),saturation=0, hue=0, always_apply=True) #Contrast
+            A.harpen(alpha=(0.05, 0.95), always_apply=True) #Sharpness
+            A.ColorJitter(brightness=0,contrast=0,saturation=(1.05,1.95), hue=0, always_apply=True) #Color
+            A.ColorJitter(brightness=(0.05,0.95),contrast=0,saturation=0, hue=0, always_apply=True) #Brightness
+            A.ColorJitter(brightness=0,contrast=0,saturation=0, hue=(0,0.5), always_apply=True) #Hue
+            A.posterize(bits=4)
+            A.solarize (threshold=128)
+        ], n=3),
         A.Normalize(),
         ToTensorV2()
     ]
 )
 
-dataset = CustomDataset(csv_file=  os.path.join(args.datadir, 'train_source.csv'), transform=transform)
+
+dataset = CustomDataset(csv_file=  os.path.join(args.datadir, 'train_source.csv'), transform=transform_A_g)
 dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, drop_last=True)
-val_dataset = CustomDataset(csv_file=  os.path.join(args.datadir, 'val_source.csv'), transform=transform)
+val_dataset = CustomDataset(csv_file=  os.path.join(args.datadir, 'val_source.csv'), transform=transform_A_g)
 val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
-target_data = Target(csv_file= os.path.join(args.datadir, 'train_target.csv'), transform=transform)
+target_data = Target(csv_file= os.path.join(args.datadir, 'train_target.csv'), transform=transform_A_g)
 target_loader = DataLoader(target_data, batch_size=args.batch_size, shuffle=True, num_workers=4, drop_last=True) 
 
 
@@ -222,6 +231,7 @@ for epoch in range(args.epochs):  # 에폭
             # 3. forward concate labeled + unlabeld into student networks
             num_labeled = len(source_image) # b
             #여기에는 targetdata가 augmentation(Ar(Aa))된 데이터가 들어가야 된다.
+            target_image=transform_A_r(target_image) #apply random intensity-based augmentation
             pred_all = student_model(torch.cat((source_image, target_image), dim=0)) # ( 2*b, 13, w/4, h/4) 
             pred_all = nnf.interpolate(pred_all, size=(args.resize, args.resize), mode='bicubic', align_corners=True)
             # pred all [2b, 13, w, h]
