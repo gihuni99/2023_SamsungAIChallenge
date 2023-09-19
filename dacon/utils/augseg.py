@@ -2,7 +2,7 @@ import torch
 import numpy as np
 import torch.nn.functional as F
 
-def intersectionAndUnion(output, target, K, ignore_index=255):
+def intersectionAndUnion(output, target, K, ignore_index=12):
     # 'K' classes, output and target sizes are N or N * L or N * H * W, each value in range 0 to K - 1.
     assert output.ndim in [1, 2, 3]
     assert output.shape == target.shape
@@ -16,11 +16,12 @@ def intersectionAndUnion(output, target, K, ignore_index=255):
     area_union = area_output + area_target - area_intersection
     return area_intersection, area_union, area_target
 
-def compute_unsupervised_loss_by_threshold(predict, target, logits, thresh=0.95):
+def compute_unsupervised_loss_by_threshold(predict, target, logits, criterion, thresh=0.95, ignore_index=12):
     batch_size, num_class, h, w = predict.shape
-    thresh_mask = logits.ge(thresh).bool() * (target != 255).bool()
-    target[~thresh_mask] = 255
-    loss = F.cross_entropy(predict, target, ignore_index=255, reduction="none")
+    thresh_mask = logits.ge(thresh).bool() * (target != ignore_index).bool()
+    target[~thresh_mask] = ignore_index
+    loss = criterion(predict, target)
+    # loss = F.cross_entropy(predict, target, ignore_index=ignore_index, reduction="none")
     return loss.mean(), thresh_mask.float().mean()
 
 def rand_bbox(size, lam=None):
