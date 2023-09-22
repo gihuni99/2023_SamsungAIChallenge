@@ -11,14 +11,23 @@ from torch.utils.data import Dataset, DataLoader
 from torch.utils.data import RandomSampler
 from torchvision import transforms
 import torch.nn.functional as nnf
+from ignite.handlers.param_scheduler import create_lr_scheduler_with_warmup
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, CyclicLR, ExponentialLR
 from tqdm import tqdm
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
-from utils.segformer import SegFormer
+from proj.Dacon.dacon.utils.segformer_old import Segformer
 from utils.dataloader import CustomDataset, Target
 from utils.augseg import *
-from utils.loss_helper import CriterionOhem
+from einops import rearrange
+from torchvision.utils import save_image
+
+#https://github.com/katsura-jp/pytorch-cosine-annealing-with-warmup
+from cosine_annealing_warmup import CosineAnnealingWarmupRestarts #lr scheduler
+
+#pretrain모델 사용
+from transformers import SegformerFeatureExtractor, SegformerForSemanticSegmentation
+
 
 # 1. Data증강 부분 분리/함수 추가/제거 + Fisheye << 이거에 집착하지말고 가장 나중에.. (구현 완료, but 목적에 맞게 수정 필요)
 # 2. Pytorch 호환되는지 확인 후 Segformer 부분 HuggingFace 이용해서 불러오고. 적용 (전이학습) (loss 문제 해결 이후 구현 예정)
@@ -44,9 +53,8 @@ parser.add_argument("--batch_size", type=int, default=16)
 parser.add_argument("--datadir", type=str, default="./dataset")
 parser.add_argument("--outdir", type=str, default="./out")
 parser.add_argument("--warmup", type=int, default=0, help="0 or 1")
-parser.add_argument("--ema_decay", type=int, default=0.996)
-parser.add_argument("--debug_mode", type=bool, default=False)
 args = parser.parse_args()
+
 
 
 if not os.path.exists(args.outdir):
@@ -56,18 +64,17 @@ tm = localtime(time())
 starttime = strftime('%Y-%m-%d-%H:%M:%S',tm)
 
 # start a new wandb run to track this script
-if args.debug_mode == False:
-    wandb.init(
-        # set the wandb project where this run will be logged
-        project="dacon-2023-09",
-        # track hyperparameters and run metadata
-        config={
-        "learning_rate": args.lr,
-        "architecture": "Domain Adaptive Semantic Segmentation",
-        "dataset": "dacon",
-        "epochs": args.epochs,
-        }
-    )
+wandb.init(
+    # set the wandb project where this run will be logged
+    project="dacon-2023-09",
+    # track hyperparameters and run metadata
+    config={
+    "learning_rate": args.lr,
+    "architecture": "Domain Adaptive Semantic Segmentation",
+    "dataset": "dacon",
+    "epochs": args.epochs,
+    }
+)
 
 
 
@@ -98,7 +105,7 @@ transform_A_g = A.Compose(
 #A_r(random intensity-based augmentation)
 transform_A_r = A.Compose( #augmentation중에서 줄일거는 줄이고 우리한테 적합한 것 추가
     [   
-        A.SomeOf([ # one of 가 나은듯.
+        A.OneOf([ # one of 가 나은듯.
             A.ColorJitter(brightness=0,contrast=0,saturation=0, hue=0, always_apply=True), #Identity
             A.ColorJitter(brightness=0,contrast=(2,2),saturation=0, hue=0, always_apply=True), #Autocontrast
             A.Equalize(mode='cv', always_apply=True), #Histogram Equalization
@@ -110,7 +117,7 @@ transform_A_r = A.Compose( #augmentation중에서 줄일거는 줄이고 우리�
             A.ColorJitter(brightness=0,contrast=0,saturation=0, hue=(0,0.5), always_apply=True), #Hue
             A.Posterize(always_apply=True),
             A.Solarize (always_apply=True),
-        ], n=3, p=1)
+        ], p=1)
     ]
 )
 test_transform = A.Compose(
@@ -131,35 +138,34 @@ val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=Tru
 test_dataset = CustomDataset(csv_file= os.path.join(args.datadir, 'test.csv'), mode='test', transform=test_transform, datadir=args.datadir)
 test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
 
+
+#pre-train모델: segformer-b5-finetuned-cityscapes-1024-1024
+teacher_model = SegformerForSemanticSegmentation.from_pretrained("nvidia/segformer-b5-finetuned-cityscapes-1024-1024").to(device)
+student_model = SegformerForSemanticSegmentation.from_pretrained("nvidia/segformer-b5-finetuned-cityscapes-1024-1024").to(device)
+
+
 # student_model 초기화
-student_model = SegFormer( # b3
-    in_channels=3,
-    widths=[64, 128, 256, 512],
-    depths=[3, 4, 6, 3],
-    all_num_heads=[1, 2, 4, 8],
-    patch_sizes=[7, 3, 3, 3],
-    overlap_sizes=[4, 2, 2, 2],
-    reduction_ratios=[8, 4, 2, 1],
-    mlp_expansions=[4, 4, 4, 4],
-    decoder_channels=256,
-    scale_factors=[8, 4, 2, 1],
-    num_classes=13,
-).to(device)
+# student_model = Segformer(
+#     dims = (32, 64, 160, 256),      # dimensions of each stage
+#     heads = (1, 2, 5, 8),           # heads of each stage
+#     ff_expansion = (8, 8, 4, 4),    # feedforward expansion factor of each stage
+#     reduction_ratio = (8, 4, 2, 1), # reduction ratio of each stage for efficient attention
+#     num_layers = 2,                 # num layers of each stage
+#     decoder_dim = 256,              # decoder dimension
+#     num_classes = 13                 # number of segmentation classes
+# ).to(device)
+
 
 # teacher_model 초기화
-teacher_model = SegFormer(
-    in_channels=3,
-    widths=[64, 128, 256, 512],
-    depths=[3, 4, 6, 3],
-    all_num_heads=[1, 2, 4, 8],
-    patch_sizes=[7, 3, 3, 3],
-    overlap_sizes=[4, 2, 2, 2],
-    reduction_ratios=[8, 4, 2, 1],
-    mlp_expansions=[4, 4, 4, 4],
-    decoder_channels=256,
-    scale_factors=[8, 4, 2, 1],
-    num_classes=13,
-).to(device)
+# teacher_model = Segformer(
+#     dims = (32, 64, 160, 256),      # dimensions of each stage
+#     heads = (1, 2, 5, 8),           # heads of each stage
+#     ff_expansion = (8, 8, 4, 4),    # feedforward expansion factor of each stage
+#     reduction_ratio = (8, 4, 2, 1), # reduction ratio of each stage for efficient attention
+#     num_layers = 2,                 # num layers of each stage
+#     decoder_dim = 256,              # decoder dimension
+#     num_classes = 13                 # number of segmentation classes
+# ).to(device)
 
 for p in teacher_model.parameters():
     p.requires_grad = False
@@ -181,7 +187,7 @@ for param_tensor in student_model.state_dict():
 
 
 # loss function과 optimizer 정의
-ce_loss = torch.nn.CrossEntropyLoss(reduction="none")
+ce_loss = torch.nn.CrossEntropyLoss(ignore_index=12, reduction="none")
 optimizer = torch.optim.Adam(student_model.parameters(), lr=args.lr)
 #scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10,eta_min=0.001)
 
@@ -194,14 +200,13 @@ scheduler = ExponentialLR(optimizer, gamma=0.98)
 #                                             warmup_start_value=0.01,
 #                                             warmup_end_value=0.1,
 #                                             warmup_duration=3)
-sup_loss_fn=CriterionOhem(aux_weight=0,thresh=0.7,min_kept=100000,ignore_index=255)
 
 bestmIoU=0 #best_chekpoint 저장용
 # training loop,
 for epoch in range(args.epochs):  # 에폭
     student_model.train()
     teacher_model.eval()
-    ema_decay_origin = args.ema_decay
+    ema_decay_origin = 0.999
     warmup_epoch = args.warmup
     epoch_loss = 0
     l_x_loss = 0
@@ -209,21 +214,19 @@ for epoch in range(args.epochs):  # 에폭
     data_length = min(len(dataloader), len(target_loader))
     if epoch < warmup_epoch:
         for images, masks in tqdm(dataloader):
-            optimizer.zero_grad()
             images = images.float().to(device)
             masks = masks.long().to(device)
             p_y = student_model(images)
-            p_y = nnf.interpolate(p_y, size=(args.resize, args.resize), mode='bicubic', align_corners=False)
-            p_y = torch.softmax(p_y, dim=1)
-            l_x = sup_loss_fn(p_y, masks)
+            p_y = nnf.interpolate(p_y, size=(args.resize, args.resize), mode='bicubic', align_corners=True)
+            l_x = ce_loss(p_y, masks.squeeze(1))
             # l_x = F.cross_entropy(p_y, masks.squeeze(1), ignore_index=12, reduction="none")
             l_u = torch.tensor(0.0).cuda()
             
             loss = l_x + l_u
 
             # update student model
-            # optimizer.zero_grad()
-            loss.mean().backward()
+            optimizer.zero_grad()
+            loss.backward()
             optimizer.step()
             epoch_loss += loss.mean()
             l_x_loss += l_x.mean()
@@ -242,19 +245,15 @@ for epoch in range(args.epochs):  # 에폭
             source_mask = source_mask.long().to(device)
             target_weak = target_weak.float().to(device)
             target_strong = target_strong.float().to(device)
-            optimizer.zero_grad()
-            #print(source_image.shape,source_mask.shape,target_weak,target_strong)
             # generate pseudo label
             with torch.no_grad():
                 teacher_model.eval()
                 pred_t = teacher_model(target_weak.detach()) #Ar(Aa)가 적용되지 않은 데이터가 들어가야 됨(Ag만 적용된)
-                # print(f'target_weak:{target_weak}, pred_t:{pred_t}')
-                #print(pred_t)
-                pred_t = nnf.interpolate(pred_t, size=(args.resize, args.resize), mode='bicubic', align_corners=False)
+                pred_t = nnf.interpolate(pred_t, size=(args.resize, args.resize), mode='bicubic', align_corners=True)
                 pred_t = torch.softmax(pred_t, dim=1)
                 # p_t = torch.argmax(p_t, dim=1)
                 p_t_logit, p_t = torch.max(pred_t, dim=1)
-                #print('1','p_t:', p_t[0,0,0])
+                
                 # obtain confidence
                 entropy = -torch.sum(pred_t * torch.log(pred_t + 1e-10), dim=1)
                 entropy /= np.log(13)
@@ -262,10 +261,10 @@ for epoch in range(args.epochs):  # 에폭
                 confidence = confidence * p_t_logit
                 confidence = confidence.mean(dim=[1,2])  # 1*C
                 confidence = confidence.cpu().numpy().tolist()
-                del pred_t
                 # confidence = logits_u_aug.ge(p_threshold).float().mean(dim=[1,2]).cpu().numpy().tolist()
             student_model.train()
             #apply addptive cutmix(adaptive label-injecting CutMix augmentation)
+
             if np.random.uniform(0,1) < 0.5:
                 target_strong, p_t, p_t_logit = cut_mix_label_adaptive(target_strong, p_t, p_t_logit, source_image, source_mask.squeeze(1), confidence)
                 # save_image(target_strong, './test_img/cut_mix_target.png')
@@ -292,37 +291,18 @@ for epoch in range(args.epochs):  # 에폭
             num_labeled = len(source_image) # b
             #여기에는 targetdata가 augmentation(Ar(Aa))된 데이터가 들어가야 된다.
             pred_all = student_model(torch.cat((source_image, target_strong), dim=0))
-            del source_image, target_strong, target_weak
-            pred_all = nnf.interpolate(pred_all, size=(args.resize, args.resize), mode='bicubic', align_corners=False)
-            #pred_all = torch.softmax(pred_all, dim=1) #gihun
-
-            pred_l = pred_all[:num_labeled]
+            pred_all = nnf.interpolate(pred_all, size=(args.resize, args.resize), mode='bicubic', align_corners=True)
+            pred_l= pred_all[:num_labeled]
             pred_u_strong = pred_all[num_labeled:]
 
-            #debugging
-            # if(epoch > 6):
-            #     print('target_strong:', target_strong[1], 'pred_l:',pred_l[1], 'p_t:', p_t[1],
-            #           'len_data', data_length, 'source_size', source_image.shape, 'strong_size', target_strong.shape,
-            #           'i_iter', i_iter, 'ena', ema_decay, 'u_strong', pred_u_strong[0], 'pred_all', pred_all.shape)
-                
-            del pred_all
             # get supervised loss (l_x)
-            # print("fffffffffff",pred_l.shape,source_mask.shape,source_mask.squeeze(1).shape)
-            # [b 13 w h](logit), [b 1 w h]-> [b w h](label)
-            
-            l_x = sup_loss_fn(pred_l, source_mask)
+            l_x = ce_loss(pred_l, source_mask.squeeze(1))
             # print(f'mask:{source_mask.size()}, squeeze:{source_mask.squeeze(1).size()}')
             # l_x = F.cross_entropy(pred_l, source_mask, ignore_index=12, reduction="none")
             
             # get unsupervised loss (l_u)
-            #print('2','epoch:',epoch, 'i_iter:', i_iter, 'source',source_mask[0,0,0],\
-            #       'pred_l:', pred_l[0,0,0,0], 'p_t:', p_t[0,0,0])
-            # l_u, pseudo_high_ratio = compute_unsupervised_loss_by_threshold(pred_u_strong, p_t.detach(), p_t_logit.detach(), criterion=ce_loss,
-            #                                                                 thresh=0.95, ignore_index=255)
-            #l_u = ce_loss(pred_u_strong, p_t.detach())
-            l_u = nnf.cross_entropy(pred_u_strong, p_t.detach(), ignore_index=255, reduction="none") #gihun
-            
-            del pred_u_strong, pred_l, p_t, p_t_logit
+            l_u, pseudo_high_ratio = compute_unsupervised_loss_by_threshold(pred_u_strong, p_t.detach(), p_t_logit.detach(), criterion=ce_loss,
+                                                                            thresh=0.95, ignore_index=12)
 
             with torch.no_grad():
                 # i_iter = epoch  * data_length + step
@@ -336,9 +316,8 @@ for epoch in range(args.epochs):  # 에폭
             #     loss = torch.tensor(0.0).cuda()
 
             # update student model
-            # optimizer.zero_grad()
+            optimizer.zero_grad()
             loss.mean().backward()
-            # loss.mean().backward()
             optimizer.step()
 
             # update teacher model with EMA
@@ -349,64 +328,45 @@ for epoch in range(args.epochs):  # 에폭
                 for buffer_train, buffer_eval in zip(student_model.buffers(), teacher_model.buffers()):
                     buffer_eval.data = buffer_eval.data * ema_decay + buffer_train.data * (1 - ema_decay)
                     # buffer_eval.data = buffer_train.data
-                epoch_loss += loss.mean()
-                l_x_loss += l_x.mean()
-                l_u_loss += l_u.mean()
+            epoch_loss += loss.mean()
+            l_x_loss += l_x.mean()
+            l_u_loss += l_u.mean()
     scheduler.step()
 
     # validation
     student_model.eval()
-    teacher_model.eval()
-    s_intersection_epoch = 0
-    s_union_epoch = 0
-    t_intersection_epoch = 0
-    t_union_epoch = 0
+    intersection_epoch = 0
+    union_epoch = 0
     for image, mask in val_dataloader:
         image = image.float().to(device)
         mask = mask.long().to(device)
         with torch.no_grad():
-            s_pred = student_model(image)
-            t_pred = teacher_model(image)
-        s_pred = nnf.interpolate(s_pred, size=(args.resize, args.resize), mode='bicubic', align_corners = False)
-        t_pred = nnf.interpolate(t_pred, size=(args.resize, args.resize), mode='bicubic', align_corners = False)
-        s_pred = torch.softmax(s_pred, dim=1).cpu()
-        t_pred = torch.softmax(t_pred, dim=1).cpu()
-        s_pred = torch.argmax(s_pred, dim=1).numpy()
-        t_pred = torch.argmax(t_pred, dim=1).numpy()
-
-
+            pred = student_model(image)
+        pred = nnf.interpolate(pred, size=(args.resize, args.resize), mode='bicubic', align_corners = True)
+        pred = torch.softmax(pred, dim=1).cpu()
+        pred = torch.argmax(pred, dim=1).numpy()
         target_origin = mask.squeeze(1).cpu().numpy()
         
-        s_intersection, s_union, target = intersectionAndUnion(s_pred, target_origin, 13, ignore_index=255)
-        t_intersection, t_union, target = intersectionAndUnion(t_pred, target_origin, 13, ignore_index=255)
-        s_intersection_epoch += s_intersection
-        t_intersection_epoch += t_intersection
-        s_union_epoch += s_union
-        t_union_epoch += t_union
-    s_iou_class = s_intersection_epoch/(s_union_epoch + 1e-10)
-    t_iou_class = t_intersection_epoch/(t_union_epoch + 1e-10)
-    s_mIoU = np.mean(s_iou_class)
-    t_mIoU = np.mean(t_iou_class)
-    if args.debug_mode == False:
-        wandb.log({"loss": epoch_loss/data_length,
-                "lr": optimizer.param_groups[0]["lr"],
-                "l_x": l_x_loss/data_length,
-                "l_u": l_u_loss/data_length,
-                "student_mIoU": s_mIoU,
-                "teacher_mIoU": t_mIoU})
+        intersection, union, target = intersectionAndUnion(pred, target_origin, 13, ignore_index=12)
+        intersection_epoch += intersection
+        union_epoch += union
+    iou_class = intersection_epoch/(union_epoch + 1e-10)
+    mIoU = np.mean(iou_class)
+
+    wandb.log({"loss": epoch_loss/data_length,
+               "lr": optimizer.param_groups[0]["lr"],
+               "l_x": l_x_loss/data_length,
+               "l_u": l_u_loss/data_length,
+               "mIoU": mIoU})
 
     print(f'Epoch: {epoch+1}, loss: {epoch_loss/data_length}, \
-            lr: {optimizer.param_groups[0]["lr"]}, student_mIoU: {s_mIoU}, \
-            teacher_mIou: {t_mIoU},\
+            lr: {optimizer.param_groups[0]["lr"]}, mIoU: {mIoU}, \
             l_x: {l_x_loss/data_length}, l_u: {l_u_loss/data_length}')
-
-    if s_mIoU > bestmIoU:
-        bestmIoU=s_mIoU
-        torch.save(student_model.state_dict(), os.path.join(args.outdir, starttime + '_best.pt'))
-        print(f'Model has been saved in {os.path.join(args.outdir, starttime)}_best.pt')
-    else:
-        torch.save(student_model.state_dict(), os.path.join(args.outdir, starttime + '_last.pt'))
-        print(f'Model has been saved in {os.path.join(args.outdir, starttime)}_last.pt')
+    #best checkpoint저장
+    if mIoU > bestmIoU:
+        bestmIoU=mIoU
+        torch.save(student_model.state_dict(), os.path.join(args.outdir, starttime + '.pt'))
+        print(f'Model has been saved in {os.path.join(args.outdir, starttime)}.pt')
 
 # Evaluation
 

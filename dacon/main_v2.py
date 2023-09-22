@@ -2,6 +2,7 @@ import os
 from PIL import Image
 import pandas as pd
 import numpy as np
+import cv2
 import argparse
 from time import strftime, time, localtime
 import wandb
@@ -19,6 +20,8 @@ from utils.segformer import SegFormer
 from utils.dataloader import CustomDataset, Target
 from utils.augseg import *
 from utils.loss_helper import CriterionOhem
+# 변경사항 : unsupervised loss 복원, ignore index, 사이즈 512
+
 
 # 1. Data증강 부분 분리/함수 추가/제거 + Fisheye << 이거에 집착하지말고 가장 나중에.. (구현 완료, but 목적에 맞게 수정 필요)
 # 2. Pytorch 호환되는지 확인 후 Segformer 부분 HuggingFace 이용해서 불러오고. 적용 (전이학습) (loss 문제 해결 이후 구현 예정)
@@ -98,7 +101,7 @@ transform_A_g = A.Compose(
 #A_r(random intensity-based augmentation)
 transform_A_r = A.Compose( #augmentation중에서 줄일거는 줄이고 우리한테 적합한 것 추가
     [   
-        A.SomeOf([ # one of 가 나은듯.
+        A.SomeOf([ # OneOf
             A.ColorJitter(brightness=0,contrast=0,saturation=0, hue=0, always_apply=True), #Identity
             A.ColorJitter(brightness=0,contrast=(2,2),saturation=0, hue=0, always_apply=True), #Autocontrast
             A.Equalize(mode='cv', always_apply=True), #Histogram Equalization
@@ -113,6 +116,7 @@ transform_A_r = A.Compose( #augmentation중에서 줄일거는 줄이고 우리�
         ], n=3, p=1)
     ]
 )
+
 test_transform = A.Compose(
     [   
         A.Resize(args.resize, args.resize),
@@ -132,7 +136,7 @@ test_dataset = CustomDataset(csv_file= os.path.join(args.datadir, 'test.csv'), m
 test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
 
 # student_model 초기화
-student_model = SegFormer( # b3
+student_model = SegFormer(
     in_channels=3,
     widths=[64, 128, 256, 512],
     depths=[3, 4, 6, 3],
@@ -194,10 +198,43 @@ scheduler = ExponentialLR(optimizer, gamma=0.98)
 #                                             warmup_start_value=0.01,
 #                                             warmup_end_value=0.1,
 #                                             warmup_duration=3)
-sup_loss_fn=CriterionOhem(aux_weight=0,thresh=0.7,min_kept=100000,ignore_index=255)
+sup_loss_fn=CriterionOhem(aux_weight=0,thresh=0.7,min_kept=100000,ignore_index=12)
 
 bestmIoU=0 #best_chekpoint 저장용
 # training loop,
+
+# for wandb
+trf = A.Compose([A.Normalize()])
+
+test_img = cv2.imread(os.path.join(args.datadir, 'train_target_image/TRAIN_TARGET_0000.png'))
+test_img = cv2.cvtColor(test_img, cv2.COLOR_BGR2RGB)
+test_img = cv2.resize(test_img, (args.resize,args.resize))
+test_img = trf(image=test_img)['image']
+test_img = np.array(test_img)
+test_img = torch.tensor(test_img, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0).to(device)
+
+class_labels = {0: "Road", 1: "Sidewalk", 2: "Construction", 3: "Fence", 4: "Pole", 5: "Traffic Light",
+                6: "Traffic Sign", 7: "Nature", 8: "Sky", 9: "Person", 10: "Rider", 11: "Car", 12: "BG"}
+
+class_set = wandb.Classes(
+    [
+        {"name": "Road", "id": 0},
+        {"name": "Sidewalk", "id": 1},
+        {"name": "Construction", "id": 2},
+        {"name": "Fence", "id": 3},
+        {"name": "Pole", "id": 4},
+        {"name": "Traffic Light", "id": 5},
+        {"name": "Traffic Sign", "id": 6},
+        {"name": "Nature", "id": 7},
+        {"name": "Sky", "id": 8},
+        {"name": "Person", "id": 9},
+        {"name": "Rider", "id": 10},
+        {"name": "Car", "id": 11},
+        {"name": "BG", "id": 12},
+    ]
+)
+
+
 for epoch in range(args.epochs):  # 에폭
     student_model.train()
     teacher_model.eval()
@@ -317,10 +354,10 @@ for epoch in range(args.epochs):  # 에폭
             # get unsupervised loss (l_u)
             #print('2','epoch:',epoch, 'i_iter:', i_iter, 'source',source_mask[0,0,0],\
             #       'pred_l:', pred_l[0,0,0,0], 'p_t:', p_t[0,0,0])
-            # l_u, pseudo_high_ratio = compute_unsupervised_loss_by_threshold(pred_u_strong, p_t.detach(), p_t_logit.detach(), criterion=ce_loss,
-            #                                                                 thresh=0.95, ignore_index=255)
+            l_u, pseudo_high_ratio = compute_unsupervised_loss_by_threshold(pred_u_strong, p_t.detach(), p_t_logit.detach(), criterion=ce_loss,
+                                                                            thresh=0.95, ignore_index=12)
             #l_u = ce_loss(pred_u_strong, p_t.detach())
-            l_u = nnf.cross_entropy(pred_u_strong, p_t.detach(), ignore_index=255, reduction="none") #gihun
+            # l_u = nnf.cross_entropy(pred_u_strong, p_t.detach(), ignore_index=255, reduction="none") #gihun
             
             del pred_u_strong, pred_l, p_t, p_t_logit
 
@@ -361,6 +398,15 @@ for epoch in range(args.epochs):  # 에폭
     s_union_epoch = 0
     t_intersection_epoch = 0
     t_union_epoch = 0
+    
+    with torch.no_grad():
+        test_out = student_model(test_img)
+        test_out = nnf.interpolate(test_out, size=(args.resize, args.resize), mode='bicubic', align_corners = False)
+        test_out = torch.softmax(test_out, dim=1).cpu()
+        test_out = torch.argmax(test_out, dim=1).numpy() # b w h
+        test_out = test_out.astype(np.uint8)
+        test_out = test_out[0,:,:] # w h
+
     for image, mask in val_dataloader:
         image = image.float().to(device)
         mask = mask.long().to(device)
@@ -374,11 +420,10 @@ for epoch in range(args.epochs):  # 에폭
         s_pred = torch.argmax(s_pred, dim=1).numpy()
         t_pred = torch.argmax(t_pred, dim=1).numpy()
 
-
         target_origin = mask.squeeze(1).cpu().numpy()
         
-        s_intersection, s_union, target = intersectionAndUnion(s_pred, target_origin, 13, ignore_index=255)
-        t_intersection, t_union, target = intersectionAndUnion(t_pred, target_origin, 13, ignore_index=255)
+        s_intersection, s_union, target = intersectionAndUnion(s_pred, target_origin, 13, ignore_index=12)
+        t_intersection, t_union, target = intersectionAndUnion(t_pred, target_origin, 13, ignore_index=12)
         s_intersection_epoch += s_intersection
         t_intersection_epoch += t_intersection
         s_union_epoch += s_union
@@ -387,13 +432,43 @@ for epoch in range(args.epochs):  # 에폭
     t_iou_class = t_intersection_epoch/(t_union_epoch + 1e-10)
     s_mIoU = np.mean(s_iou_class)
     t_mIoU = np.mean(t_iou_class)
+    ind, ct = np.unique(test_out, return_counts=True)
     if args.debug_mode == False:
+        s_pred = s_pred.astype(np.uint8)
+        s_pred = s_pred[0,:,:] # w h
+        t_pred = t_pred.astype(np.uint8)
+        t_pred = t_pred[0,:,:] # w h
         wandb.log({"loss": epoch_loss/data_length,
                 "lr": optimizer.param_groups[0]["lr"],
                 "l_x": l_x_loss/data_length,
                 "l_u": l_u_loss/data_length,
                 "student_mIoU": s_mIoU,
                 "teacher_mIoU": t_mIoU})
+        masked_image = wandb.Image(
+        image[0],
+        masks={
+            "test": {"mask_data": test_out, "class_labels": class_labels},
+            "s_pred": {"mask_data": s_pred, "class_labels": class_labels},
+            "t_pred": {"mask_data": t_pred, "class_labels": class_labels},
+        },
+            classes=class_set,
+        )
+
+        ttt = wandb.Image(
+        test_img,
+        masks={
+            "test": {"mask_data": test_out, "class_labels": class_labels},
+        },
+            classes=class_set,
+        )
+
+        table2 = wandb.Table(columns=["image"])
+        table2.add_data(ttt)
+        wandb.log({"field": table2})
+
+
+
+        
 
     print(f'Epoch: {epoch+1}, loss: {epoch_loss/data_length}, \
             lr: {optimizer.param_groups[0]["lr"]}, student_mIoU: {s_mIoU}, \
@@ -418,6 +493,7 @@ with torch.no_grad():
         outputs = student_model(images)
         outputs = torch.softmax(outputs, dim=1).cpu()
         outputs = torch.argmax(outputs, dim=1).numpy()
+        
         # batch에 존재하는 각 이미지에 대해서 반복
         for pred in outputs:
             pred = pred.astype(np.uint8)

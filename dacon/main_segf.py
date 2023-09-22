@@ -13,7 +13,7 @@ import torch.nn.functional as nnf
 from tqdm import tqdm
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
-from utils.segformer import Segformer
+from proj.Dacon.dacon.utils.segformer_old import Segformer
 from utils.dataloader import CustomDataset, Target
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -151,6 +151,7 @@ with torch.no_grad():
     for images in tqdm(test_dataloader):
         images = images.float().to(device)
         outputs = model(images)
+        outputs = nnf.interpolate(outputs, size=(args.resize, args.resize), mode='bicubic', align_corners=True)
         outputs = torch.softmax(outputs, dim=1).cpu()
         outputs = torch.argmax(outputs, dim=1).numpy()
         # batch에 존재하는 각 이미지에 대해서 반복

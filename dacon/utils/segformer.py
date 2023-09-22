@@ -1,203 +1,269 @@
-from math import sqrt
-from functools import partial
 import torch
-from torch import nn, einsum
-import torch.nn.functional as F
+from einops import rearrange
+from torch import nn
+from torchvision.ops import StochasticDepth
+from typing import List, Iterable
 
-from einops import rearrange, reduce
-from einops.layers.torch import Rearrange
+class LayerNorm2d(nn.LayerNorm):
+    def forward(self, x):
+        x = rearrange(x, "b c h w -> b h w c")
+        x = super().forward(x)
+        x = rearrange(x, "b h w c -> b c h w")
+        return x
 
-# helpers
-
-def exists(val):
-    return val is not None
-
-def cast_tuple(val, depth):
-    return val if isinstance(val, tuple) else (val,) * depth
-
-# classes
-
-class DsConv2d(nn.Module):
-    def __init__(self, dim_in, dim_out, kernel_size, padding, stride = 1, bias = True):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(dim_in, dim_in, kernel_size = kernel_size, padding = padding, groups = dim_in, stride = stride, bias = bias),
-            nn.Conv2d(dim_in, dim_out, kernel_size = 1, bias = bias)
+class OverlapPatchMerging(nn.Sequential):
+    def __init__(
+        self, in_channels: int, out_channels: int, patch_size: int, overlap_size: int
+    ):
+        super().__init__(
+            nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size=patch_size,
+                stride=overlap_size,
+                padding=patch_size // 2,
+                bias=False
+            ),
+            LayerNorm2d(out_channels)
         )
-    def forward(self, x):
-        return self.net(x)
 
-class LayerNorm(nn.Module):
-    def __init__(self, dim, eps = 1e-5):
+class EfficientMultiHeadAttention(nn.Module):
+    def __init__(self, channels: int, reduction_ratio: int = 1, num_heads: int = 8):
         super().__init__()
-        self.eps = eps
-        self.g = nn.Parameter(torch.ones(1, dim, 1, 1))
-        self.b = nn.Parameter(torch.zeros(1, dim, 1, 1))
+        self.reducer = nn.Sequential(
+            nn.Conv2d(
+                channels, channels, kernel_size=reduction_ratio, stride=reduction_ratio
+            ),
+            LayerNorm2d(channels),
+        )
+        self.att = nn.MultiheadAttention(
+            channels, num_heads=num_heads, batch_first=True
+        )
 
     def forward(self, x):
-        std = torch.var(x, dim = 1, unbiased = False, keepdim = True).sqrt()
-        mean = torch.mean(x, dim = 1, keepdim = True)
-        return (x - mean) / (std + self.eps) * self.g + self.b
+        _, _, h, w = x.shape
+        reduced_x = self.reducer(x)
+        # attention needs tensor of shape (batch, sequence_length, channels)
+        reduced_x = rearrange(reduced_x, "b c h w -> b (h w) c")
+        x = rearrange(x, "b c h w -> b (h w) c")
+        out = self.att(x, reduced_x, reduced_x)[0]
+        # reshape it back to (batch, channels, height, width)
+        out = rearrange(out, "b (h w) c -> b c h w", h=h, w=w)
+        return out
 
-class PreNorm(nn.Module):
-    def __init__(self, dim, fn):
+
+class MixMLP(nn.Sequential):
+    def __init__(self, channels: int, expansion: int = 4):
+        super().__init__(
+            # dense layer
+            nn.Conv2d(channels, channels, kernel_size=1),
+            # depth wise conv
+            nn.Conv2d(
+                channels,
+                channels * expansion,
+                kernel_size=3,
+                groups=channels,
+                padding=1,
+            ),
+            nn.GELU(),
+            # dense layer
+            nn.Conv2d(channels * expansion, channels, kernel_size=1),
+        )
+
+
+
+class ResidualAdd(nn.Module):
+    """Just an util layer"""
+    def __init__(self, fn):
         super().__init__()
         self.fn = fn
-        self.norm = LayerNorm(dim)
 
-    def forward(self, x):
-        return self.fn(self.norm(x))
+    def forward(self, x, **kwargs):
+        out = self.fn(x, **kwargs)
+        x = x + out
+        return x
 
-class EfficientSelfAttention(nn.Module):
+class SegFormerEncoderBlock(nn.Sequential):
     def __init__(
         self,
-        *,
-        dim,
-        heads,
-        reduction_ratio
+        channels: int,
+        reduction_ratio: int = 1,
+        num_heads: int = 8,
+        mlp_expansion: int = 4,
+        drop_path_prob: float = .0
     ):
-        super().__init__()
-        self.scale = (dim // heads) ** -0.5
-        self.heads = heads
+        super().__init__(
+            ResidualAdd(
+                nn.Sequential(
+                    LayerNorm2d(channels),
+                    EfficientMultiHeadAttention(channels, reduction_ratio, num_heads),
+                )
+            ),
+            ResidualAdd(
+                nn.Sequential(
+                    LayerNorm2d(channels),
+                    MixMLP(channels, expansion=mlp_expansion),
+                    StochasticDepth(p=drop_path_prob, mode="batch")
+                )
+            ),
+        )
 
-        self.to_q = nn.Conv2d(dim, dim, 1, bias = False)
-        self.to_kv = nn.Conv2d(dim, dim * 2, reduction_ratio, stride = reduction_ratio, bias = False)
-        self.to_out = nn.Conv2d(dim, dim, 1, bias = False)
-
-    def forward(self, x):
-        h, w = x.shape[-2:]
-        heads = self.heads
-
-        q, k, v = (self.to_q(x), *self.to_kv(x).chunk(2, dim = 1))
-        q, k, v = map(lambda t: rearrange(t, 'b (h c) x y -> (b h) (x y) c', h = heads), (q, k, v))
-
-        sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
-        attn = sim.softmax(dim = -1)
-
-        out = einsum('b i j, b j d -> b i d', attn, v)
-        out = rearrange(out, '(b h) (x y) c -> b (h c) x y', h = heads, x = h, y = w)
-        return self.to_out(out)
-
-class MixFeedForward(nn.Module):
+class SegFormerEncoderStage(nn.Sequential):
     def __init__(
         self,
-        *,
-        dim,
-        expansion_factor
+        in_channels: int,
+        out_channels: int,
+        patch_size: int,
+        overlap_size: int,
+        drop_probs: List[int],
+        depth: int = 2,
+        reduction_ratio: int = 1,
+        num_heads: int = 8,
+        mlp_expansion: int = 4,
     ):
         super().__init__()
-        hidden_dim = dim * expansion_factor
-        self.net = nn.Sequential(
-            nn.Conv2d(dim, hidden_dim, 1),
-            DsConv2d(hidden_dim, hidden_dim, 3, padding = 1),
-            nn.GELU(),
-            nn.Conv2d(hidden_dim, dim, 1)
+        self.overlap_patch_merge = OverlapPatchMerging(
+            in_channels, out_channels, patch_size, overlap_size,
+        )
+        self.blocks = nn.Sequential(
+            *[
+                SegFormerEncoderBlock(
+                    out_channels, reduction_ratio, num_heads, mlp_expansion, drop_probs[i]
+                )
+                for i in range(depth)
+            ]
+        )
+        self.norm = LayerNorm2d(out_channels)
+
+
+def chunks(data: Iterable, sizes: List[int]):
+    """
+    Given an iterable, returns slices using sizes as indices
+    """
+    curr = 0
+    for size in sizes:
+        chunk = data[curr: curr + size]
+        curr += size
+        yield chunk
+        
+class SegFormerEncoder(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        widths: List[int],
+        depths: List[int],
+        all_num_heads: List[int],
+        patch_sizes: List[int],
+        overlap_sizes: List[int],
+        reduction_ratios: List[int],
+        mlp_expansions: List[int],
+        drop_prob: float = .0
+    ):
+        super().__init__()
+        # create drop paths probabilities (one for each stage's block)
+        drop_probs =  [x.item() for x in torch.linspace(0, drop_prob, sum(depths))]
+        self.stages = nn.ModuleList(
+            [
+                SegFormerEncoderStage(*args)
+                for args in zip(
+                    [in_channels, *widths],
+                    widths,
+                    patch_sizes,
+                    overlap_sizes,
+                    chunks(drop_probs, sizes=depths),
+                    depths,
+                    reduction_ratios,
+                    all_num_heads,
+                    mlp_expansions
+                )
+            ]
+        )
+        
+    def forward(self, x):
+        features = []
+        for stage in self.stages:
+            x = stage(x)
+            features.append(x)
+        return features
+    
+class SegFormerDecoderBlock(nn.Sequential):
+    def __init__(self, in_channels: int, out_channels: int, scale_factor: int = 2):
+        super().__init__(
+            nn.UpsamplingBilinear2d(scale_factor=scale_factor),
+            nn.Conv2d(in_channels, out_channels, kernel_size=1),
+        )
+
+class SegFormerDecoder(nn.Module):
+    def __init__(self, out_channels: int, widths: List[int], scale_factors: List[int]):
+        super().__init__()
+        self.stages = nn.ModuleList(
+            [
+                SegFormerDecoderBlock(in_channels, out_channels, scale_factor)
+                for in_channels, scale_factor in zip(widths, scale_factors)
+            ]
+        )
+    
+    def forward(self, features):
+        new_features = []
+        for feature, stage in zip(features,self.stages):
+            x = stage(feature)
+            new_features.append(x)
+        return new_features
+    
+
+class SegFormerSegmentationHead(nn.Module):
+    def __init__(self, channels: int, num_classes: int, num_features: int = 4):
+        super().__init__()
+        self.fuse = nn.Sequential(
+            nn.Conv2d(channels * num_features, channels, kernel_size=1, bias=False),
+            nn.ReLU(), # why relu? Who knows
+            nn.BatchNorm2d(channels) # why batchnorm and not layer norm? Idk
+        )
+        self.predict = nn.Conv2d(channels, num_classes, kernel_size=1)
+
+    def forward(self, features):
+        x = torch.cat(features, dim=1)
+        x = self.fuse(x)
+        x = self.predict(x)
+        return x
+    
+
+class SegFormer(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        widths: List[int],
+        depths: List[int],
+        all_num_heads: List[int],
+        patch_sizes: List[int],
+        overlap_sizes: List[int],
+        reduction_ratios: List[int],
+        mlp_expansions: List[int],
+        decoder_channels: int,
+        scale_factors: List[int],
+        num_classes: int,
+        drop_prob: float = 0.0,
+    ):
+
+        super().__init__()
+        self.encoder = SegFormerEncoder(
+            in_channels,
+            widths,
+            depths,
+            all_num_heads,
+            patch_sizes,
+            overlap_sizes,
+            reduction_ratios,
+            mlp_expansions,
+            drop_prob,
+        )
+        self.decoder = SegFormerDecoder(decoder_channels, widths[::-1], scale_factors)
+        self.head = SegFormerSegmentationHead(
+            decoder_channels, num_classes, num_features=len(widths)
         )
 
     def forward(self, x):
-        return self.net(x)
-
-class MiT(nn.Module):
-    def __init__(
-        self,
-        *,
-        channels,
-        dims,
-        heads,
-        ff_expansion,
-        reduction_ratio,
-        num_layers
-    ):
-        super().__init__()
-        stage_kernel_stride_pad = ((7, 4, 3), (3, 2, 1), (3, 2, 1), (3, 2, 1))
-
-        dims = (channels, *dims)
-        dim_pairs = list(zip(dims[:-1], dims[1:]))
-
-        self.stages = nn.ModuleList([])
-
-        for (dim_in, dim_out), (kernel, stride, padding), num_layers, ff_expansion, heads, reduction_ratio in zip(dim_pairs, stage_kernel_stride_pad, num_layers, ff_expansion, heads, reduction_ratio):
-            get_overlap_patches = nn.Unfold(kernel, stride = stride, padding = padding)
-            overlap_patch_embed = nn.Conv2d(dim_in * kernel ** 2, dim_out, 1)
-
-            layers = nn.ModuleList([])
-
-            for _ in range(num_layers):
-                layers.append(nn.ModuleList([
-                    PreNorm(dim_out, EfficientSelfAttention(dim = dim_out, heads = heads, reduction_ratio = reduction_ratio)),
-                    PreNorm(dim_out, MixFeedForward(dim = dim_out, expansion_factor = ff_expansion)),
-                ]))
-
-            self.stages.append(nn.ModuleList([
-                get_overlap_patches,
-                overlap_patch_embed,
-                layers
-            ]))
-
-    def forward(
-        self,
-        x,
-        return_layer_outputs = False
-    ):
-        h, w = x.shape[-2:]
-
-        layer_outputs = []
-        for (get_overlap_patches, overlap_embed, layers) in self.stages:
-            x = get_overlap_patches(x)
-
-            num_patches = x.shape[-1]
-            ratio = int(sqrt((h * w) / num_patches))
-            x = rearrange(x, 'b c (h w) -> b c h w', h = h // ratio)
-
-            x = overlap_embed(x)
-            for (attn, ff) in layers:
-                x = attn(x) + x
-                x = ff(x) + x
-
-            layer_outputs.append(x)
-
-        ret = x if not return_layer_outputs else layer_outputs
-        return ret
-
-class Segformer(nn.Module):
-    def __init__(
-        self,
-        *,
-        dims = (32, 64, 160, 256),
-        heads = (1, 2, 5, 8),
-        ff_expansion = (8, 8, 4, 4),
-        reduction_ratio = (8, 4, 2, 1),
-        num_layers = 2,
-        channels = 3,
-        decoder_dim = 256,
-        num_classes = 4
-    ):
-        super().__init__()
-        dims, heads, ff_expansion, reduction_ratio, num_layers = map(partial(cast_tuple, depth = 4), (dims, heads, ff_expansion, reduction_ratio, num_layers))
-        assert all([*map(lambda t: len(t) == 4, (dims, heads, ff_expansion, reduction_ratio, num_layers))]), 'only four stages are allowed, all keyword arguments must be either a single value or a tuple of 4 values'
-
-        self.mit = MiT(
-            channels = channels,
-            dims = dims,
-            heads = heads,
-            ff_expansion = ff_expansion,
-            reduction_ratio = reduction_ratio,
-            num_layers = num_layers
-        )
-
-        self.to_fused = nn.ModuleList([nn.Sequential(
-            nn.Conv2d(dim, decoder_dim, 1),
-            nn.Upsample(scale_factor = 2 ** i)
-        ) for i, dim in enumerate(dims)])
-
-        self.to_segmentation = nn.Sequential(
-            nn.Conv2d(4 * decoder_dim, decoder_dim, 1),
-            nn.Conv2d(decoder_dim, num_classes, 1),
-        )
-
-    def forward(self, x):
-        layer_outputs = self.mit(x, return_layer_outputs = True)
-
-        fused = [to_fused(output) for output, to_fused in zip(layer_outputs, self.to_fused)]
-        fused = torch.cat(fused, dim = 1)
-        return self.to_segmentation(fused)
+        features = self.encoder(x)
+        features = self.decoder(features[::-1])
+        segmentation = self.head(features)
+        return segmentation

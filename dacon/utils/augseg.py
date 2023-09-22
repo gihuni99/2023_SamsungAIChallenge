@@ -16,7 +16,7 @@ def intersectionAndUnion(output, target, K, ignore_index=12):
     area_union = area_output + area_target - area_intersection
     return area_intersection, area_union, area_target
 
-def compute_unsupervised_loss_by_threshold(predict, target, logits, criterion, thresh=0.95, ignore_index=12):
+def compute_unsupervised_loss_by_threshold(predict, target, logits, criterion, thresh=0.95, ignore_index=255):
     batch_size, num_class, h, w = predict.shape
     thresh_mask = logits.ge(thresh).bool() * (target != ignore_index).bool()
     target[~thresh_mask] = ignore_index

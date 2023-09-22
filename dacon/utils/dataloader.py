@@ -8,23 +8,6 @@ import numpy as np
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
-img_tr=transforms.ToPILImage()
-
-def image_unnorm(image):
-    # 정규화된 이미지 데이터
-    normalized_image =image
-    normalized_image=normalized_image.cpu()
-    normalized_image=np.array(normalized_image,dtype=np.uint8)
-    normalized_image=np.transpose(normalized_image,(1,2,0))#[c h w]->[h w c](transform_A_r의 input형식)
-    # 평균과 표준 편차
-    #mean = (0.485, 0.456, 0.406)
-    #std = (0.229, 0.224, 0.225)
-    #restored_image = normalized_image * np.array(std) + np.array(mean)
-    #restored_image = np.clip(restored_image, 0, 1)
-    #restored_image = (restored_image * 255).astype(np.uint8)
-    return normalized_image #restored_image
-
-
 
 class CustomDataset(Dataset):
     def __init__(self, csv_file, transform=None, mode='train', datadir="./dataset"):
@@ -46,6 +29,7 @@ class CustomDataset(Dataset):
         image = cv2.imread(img_path)
         # cv2.imwrite("./test_img/origin_source.png", image)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        assert not np.any(np.isnan(image)), "image nan"
 
         if self.mode=='test' and self.transform:
             # cv2.imwrite("./test_img/origin_test.png", image)
@@ -54,6 +38,7 @@ class CustomDataset(Dataset):
         
         mask_path = os.path.join(self.datadir, self.data.iloc[idx, 2])
         mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        assert not np.any(np.isnan(mask)), "mask nan"
         mask[mask == 255] = 12 #배경을 픽셀값 12로 간주
 
         if self.mode=='val' and self.transform:
@@ -67,6 +52,7 @@ class CustomDataset(Dataset):
             augmented = self.tr(image=augmented['image'], mask=augmented['mask'])
             image = augmented['image']
             mask = augmented['mask']
+
 
         return image, mask
     
@@ -89,6 +75,7 @@ class Target(Dataset):
     def __getitem__(self, idx):
         img_path = os.path.join(self.datadir, self.data.iloc[idx, 1])
         image = cv2.imread(img_path)
+        assert not np.any(np.isnan(image)), "target nan"
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         
         if self.transform and self.transform_r:

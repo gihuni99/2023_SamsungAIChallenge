@@ -13,7 +13,7 @@ import torch.nn.functional as nnf
 from tqdm import tqdm
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
-from utils.segformer import Segformer
+from proj.Dacon.dacon.utils.segformer_old import Segformer
 from utils.dataloader import CustomDataset
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
