@@ -19,6 +19,10 @@ from utils.segformer import SegFormer
 from utils.dataloader import CustomDataset, Target
 from utils.augseg import *
 from utils.loss_helper import CriterionOhem,compute_unsupervised_loss_by_threshold
+import cv2
+
+#pretrain모델 사용
+from transformers import SegformerFeatureExtractor, SegformerForSemanticSegmentation
 
 # 1. Data증강 부분 분리/함수 추가/제거 + Fisheye << 이거에 집착하지말고 가장 나중에.. (구현 완료, but 목적에 맞게 수정 필요)
 # 2. Pytorch 호환되는지 확인 후 Segformer 부분 HuggingFace 이용해서 불러오고. 적용 (전이학습) (loss 문제 해결 이후 구현 예정)
@@ -130,34 +134,37 @@ test_dataset = CustomDataset(csv_file= os.path.join(args.datadir, 'test.csv'), m
 test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
 
 # student_model 초기화
-student_model = SegFormer( # b3
-    in_channels=3,
-    widths=[64, 128, 256, 512],
-    depths=[3, 4, 6, 3],
-    all_num_heads=[1, 2, 4, 8],
-    patch_sizes=[7, 3, 3, 3],
-    overlap_sizes=[4, 2, 2, 2],
-    reduction_ratios=[8, 4, 2, 1],
-    mlp_expansions=[4, 4, 4, 4],
-    decoder_channels=256,
-    scale_factors=[8, 4, 2, 1],
-    num_classes=13,
-).to(device)
+# student_model = SegFormer( # b3
+#     in_channels=3,
+#     widths=[64, 128, 256, 512],
+#     depths=[3, 4, 6, 3],
+#     all_num_heads=[1, 2, 4, 8],
+#     patch_sizes=[7, 3, 3, 3],
+#     overlap_sizes=[4, 2, 2, 2],
+#     reduction_ratios=[8, 4, 2, 1],
+#     mlp_expansions=[4, 4, 4, 4],
+#     decoder_channels=256,
+#     scale_factors=[8, 4, 2, 1],
+#     num_classes=13,
+# ).to(device)
 
-# teacher_model 초기화
-teacher_model = SegFormer(
-    in_channels=3,
-    widths=[64, 128, 256, 512],
-    depths=[3, 4, 6, 3],
-    all_num_heads=[1, 2, 4, 8],
-    patch_sizes=[7, 3, 3, 3],
-    overlap_sizes=[4, 2, 2, 2],
-    reduction_ratios=[8, 4, 2, 1],
-    mlp_expansions=[4, 4, 4, 4],
-    decoder_channels=256,
-    scale_factors=[8, 4, 2, 1],
-    num_classes=13,
-).to(device)
+# # teacher_model 초기화
+# teacher_model = SegFormer(
+#     in_channels=3,
+#     widths=[64, 128, 256, 512],
+#     depths=[3, 4, 6, 3],
+#     all_num_heads=[1, 2, 4, 8],
+#     patch_sizes=[7, 3, 3, 3],
+#     overlap_sizes=[4, 2, 2, 2],
+#     reduction_ratios=[8, 4, 2, 1],
+#     mlp_expansions=[4, 4, 4, 4],
+#     decoder_channels=256,
+#     scale_factors=[8, 4, 2, 1],
+#     num_classes=13,
+# ).to(device)
+
+teacher_model = SegformerForSemanticSegmentation.from_pretrained("nvidia/segformer-b5-finetuned-cityscapes-1024-1024").to(device)
+student_model = SegformerForSemanticSegmentation.from_pretrained("nvidia/segformer-b5-finetuned-cityscapes-1024-1024").to(device)
 
 for p in teacher_model.parameters():
     p.requires_grad = False
@@ -194,6 +201,49 @@ scheduler = ExponentialLR(optimizer, gamma=0.98)
 #                                             warmup_end_value=0.1,
 #                                             warmup_duration=3)
 sup_loss_fn=CriterionOhem(aux_weight=0,thresh=0.7,min_kept=100000,ignore_index=255)
+
+# for wandb
+trf = A.Compose([A.Normalize()])
+
+test_img_o = cv2.imread(os.path.join(args.datadir, 'train_target_image/TRAIN_TARGET_0743.png'))
+val_img_o = cv2.imread(os.path.join(args.datadir, 'val_source_image/VALID_SOURCE_211.png'))
+val_mask_o = cv2.imread(os.path.join(args.datadir, 'val_source_gt/VALID_SOURCE_211.png'), cv2.IMREAD_GRAYSCALE)
+test_img_o = cv2.resize(test_img_o, (args.resize, args.resize))
+val_img_o = cv2.resize(val_img_o, (args.resize, args.resize))
+val_mask_o = cv2.resize(val_mask_o, (args.resize, args.resize))
+val_mask_o[val_mask_o == 255] = 12 #배경을 픽셀값 12로 간주
+
+test_img_o = cv2.cvtColor(test_img_o, cv2.COLOR_BGR2RGB)
+val_img_o = cv2.cvtColor(val_img_o, cv2.COLOR_BGR2RGB)
+test_img = trf(image=test_img_o)['image']
+val_img = trf(image=val_img_o)['image']
+test_img = np.array(test_img)
+val_img = np.array(val_img)
+test_img = torch.tensor(test_img, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0).to(device)
+val_img = torch.tensor(val_img, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0).to(device)
+
+class_labels = {0: "Road", 1: "Sidewalk", 2: "Construction", 3: "Fence", 4: "Pole", 5: "Traffic Light",
+                6: "Traffic Sign", 7: "Nature", 8: "Sky", 9: "Person", 10: "Rider", 11: "Car", 12: "BG"}
+
+class_set = wandb.Classes(
+    [
+        {"name": "Road", "id": 0},
+        {"name": "Sidewalk", "id": 1},
+        {"name": "Construction", "id": 2},
+        {"name": "Fence", "id": 3},
+        {"name": "Pole", "id": 4},
+        {"name": "Traffic Light", "id": 5},
+        {"name": "Traffic Sign", "id": 6},
+        {"name": "Nature", "id": 7},
+        {"name": "Sky", "id": 8},
+        {"name": "Person", "id": 9},
+        {"name": "Rider", "id": 10},
+        {"name": "Car", "id": 11},
+        {"name": "BG", "id": 12},
+    ]
+)
+
+
 
 bestmIoU=0 #best_chekpoint 저장용
 # training loop,
@@ -249,7 +299,7 @@ for epoch in range(args.epochs):  # 에폭
                 pred_t = teacher_model(target_weak.detach()) #Ar(Aa)가 적용되지 않은 데이터가 들어가야 됨(Ag만 적용된)
                 # print(f'target_weak:{target_weak}, pred_t:{pred_t}')
                 #print(pred_t)
-                pred_t = nnf.interpolate(pred_t, size=(args.resize, args.resize), mode='bicubic', align_corners=False)
+                #pred_t = nnf.interpolate(pred_t, size=(args.resize, args.resize), mode='bicubic', align_corners=False)
                 pred_t = torch.softmax(pred_t, dim=1)
                 # p_t = torch.argmax(p_t, dim=1)
                 p_t_logit, p_t = torch.max(pred_t, dim=1)
@@ -360,6 +410,7 @@ for epoch in range(args.epochs):  # 에폭
     s_union_epoch = 0
     t_intersection_epoch = 0
     t_union_epoch = 0
+
     for image, mask in val_dataloader:
         image = image.float().to(device)
         mask = mask.long().to(device)
@@ -373,7 +424,6 @@ for epoch in range(args.epochs):  # 에폭
         s_pred = torch.argmax(s_pred, dim=1).numpy()
         t_pred = torch.argmax(t_pred, dim=1).numpy()
 
-
         target_origin = mask.squeeze(1).cpu().numpy()
         
         s_intersection, s_union, target = intersectionAndUnion(s_pred, target_origin, 13, ignore_index=255)
@@ -386,13 +436,46 @@ for epoch in range(args.epochs):  # 에폭
     t_iou_class = t_intersection_epoch/(t_union_epoch + 1e-10)
     s_mIoU = np.mean(s_iou_class)
     t_mIoU = np.mean(t_iou_class)
-    if args.debug_mode == False:
-        wandb.log({"loss": epoch_loss/data_length,
-                "lr": optimizer.param_groups[0]["lr"],
-                "l_x": l_x_loss/data_length,
-                "l_u": l_u_loss/data_length,
-                "student_mIoU": s_mIoU,
-                "teacher_mIoU": t_mIoU})
+    if args.debug_mode == False: # for logging wandb panels
+        with torch.no_grad():
+            s_pred = student_model(val_img)
+            t_pred = teacher_model(val_img)
+            test_out = student_model(test_img)
+            s_pred = nnf.interpolate(s_pred, size=(args.resize, args.resize), mode='bicubic', align_corners = False)
+            t_pred = nnf.interpolate(t_pred, size=(args.resize, args.resize), mode='bicubic', align_corners = False)
+            test_out = nnf.interpolate(test_out, size=(args.resize, args.resize), mode='bicubic', align_corners = False)
+            s_pred = torch.softmax(s_pred, dim=1).cpu()
+            t_pred = torch.softmax(t_pred, dim=1).cpu()
+            test_out = torch.softmax(test_out, dim=1).cpu()
+            s_pred = torch.argmax(s_pred, dim=1).numpy()
+            t_pred = torch.argmax(t_pred, dim=1).numpy()
+            test_out = torch.argmax(test_out, dim=1).numpy()
+            s_pred = s_pred.astype(np.uint8)
+            t_pred = t_pred.astype(np.uint8)
+            test_out = test_out.astype(np.uint8)
+            s_pred = s_pred.squeeze()
+            t_pred = t_pred.squeeze()
+            test_out = test_out.squeeze()
+
+            wandb.log({"loss": epoch_loss/data_length,
+                    "lr": optimizer.param_groups[0]["lr"],
+                    "l_x": l_x_loss/data_length,
+                    "l_u": l_u_loss/data_length,
+                    "student_mIoU": s_mIoU,
+                    "teacher_mIoU": t_mIoU,
+                    "s_pred": wandb.Image(val_img_o, masks={
+                        "s_pred": {"mask_data": s_pred, "class_labels": class_labels}},
+                        classes=class_set),
+                    "gt:": wandb.Image(val_img_o, masks={
+                        "gt": {"mask_data": val_mask_o, "class_labels": class_labels}},
+                        classes=class_set),
+                    "t_pred:": wandb.Image(val_img_o, masks={
+                        "t_pred": {"mask_data": t_pred, "class_labels": class_labels}},
+                        classes=class_set),
+                    "test": wandb.Image(test_img_o, masks={
+                        "test": {"mask_data": test_out, "class_labels": class_labels}},
+                        classes=class_set),
+                    })
 
     print(f'Epoch: {epoch+1}, loss: {epoch_loss/data_length}, \
             lr: {optimizer.param_groups[0]["lr"]}, student_mIoU: {s_mIoU}, \

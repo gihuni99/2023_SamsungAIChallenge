@@ -178,11 +178,13 @@ class SegFormerEncoder(nn.Module):
                 )
             ]
         )
+        self.dropout=nn.Dropout(p=0.2)
         
     def forward(self, x):
         features = []
         for stage in self.stages:
             x = stage(x)
+            #x =self.dropout(x) #dropout추가
             features.append(x)
         return features
     
@@ -202,11 +204,13 @@ class SegFormerDecoder(nn.Module):
                 for in_channels, scale_factor in zip(widths, scale_factors)
             ]
         )
+        self.dropout=nn.Dropout(p=0.2)
     
     def forward(self, features):
         new_features = []
         for feature, stage in zip(features,self.stages):
             x = stage(feature)
+            #x=self.dropout(x)#dropout
             new_features.append(x)
         return new_features
     

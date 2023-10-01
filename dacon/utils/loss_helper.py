@@ -27,7 +27,6 @@ def get_criterion(cfg):
 
     return criterion
 
-
 class Criterion(nn.Module):
     def __init__(self, aux_weight, ignore_index=255, use_weight=False):
         super(Criterion, self).__init__()

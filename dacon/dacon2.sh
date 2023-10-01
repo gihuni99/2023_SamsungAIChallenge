@@ -6,4 +6,4 @@
 mkdir -p ./out
 eval "$(conda shell.bash hook)"
 conda activate python3.9
-python -u main_segf_augseg_gihun.py --epoch 9 --resize 256 --lr 0.00006 --batch_size 4 --datadir ./dataset --outdir ./out --warmup 0
+python -u main_v2.py --epoch 50 --resize 512 --lr 0.00006 --batch_size 8 --datadir ./dataset --outdir ./out --warmup 0

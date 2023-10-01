@@ -20,8 +20,8 @@ def compute_unsupervised_loss_by_threshold(predict, target, logits, criterion, t
     batch_size, num_class, h, w = predict.shape
     thresh_mask = logits.ge(thresh).bool() * (target != ignore_index).bool()
     target[~thresh_mask] = ignore_index
-    loss = criterion(predict, target)
-    # loss = F.cross_entropy(predict, target, ignore_index=ignore_index, reduction="none")
+    # loss = criterion(predict, target)
+    loss = F.cross_entropy(predict, target, ignore_index=ignore_index, reduction="none")
     return loss.mean(), thresh_mask.float().mean()
 
 def rand_bbox(size, lam=None):
